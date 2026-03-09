@@ -20,24 +20,53 @@ def log0(message):
     if int(os.environ.get('RANK', 0)) == 0:
         logger.info(message)
 
-def _patch_missing_config_keys(model_config_kwargs):
+def _infer_engram_table_multiplier(model_config_kwargs, model_data):
+    """Infer the old hardcoded engram-lite table multiplier from checkpoint weights."""
+    bigram_weight = model_data.get("bigram_embed.embed.weight")
+    if bigram_weight is None:
+        return 5
+    vocab_size = model_config_kwargs["vocab_size"]
+    table_size = bigram_weight.shape[0]
+    assert table_size % vocab_size == 0, f"Bigram table size {table_size} is not divisible by vocab size {vocab_size}"
+    return table_size // vocab_size
+
+
+def _patch_missing_config_keys(model_config_kwargs, model_data):
     """Add default values for new config keys missing in old checkpoints."""
     # Old models were trained with full context (no sliding window)
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "engram_lite" not in model_config_kwargs:
+        has_engram = "bigram_lambdas" in model_data or "bigram_embed.embed.weight" in model_data
+        model_config_kwargs["engram_lite"] = has_engram
+        log0(f"Patching missing engram_lite in model config to {has_engram}")
+    if "engram_table_multiplier" not in model_config_kwargs:
+        multiplier = _infer_engram_table_multiplier(model_config_kwargs, model_data) if model_config_kwargs["engram_lite"] else 5
+        model_config_kwargs["engram_table_multiplier"] = multiplier
+        log0(f"Patching missing engram_table_multiplier in model config to {multiplier}")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
     n_layer = model_config.n_layer
+    ref_tensor = model_data["transformer.wte.weight"]
+    scalar_kwargs = dict(device=ref_tensor.device)
     # resid_lambdas defaults to 1.0 (identity scaling)
     if "resid_lambdas" not in model_data:
-        model_data["resid_lambdas"] = torch.ones(n_layer)
+        model_data["resid_lambdas"] = torch.ones(n_layer, **scalar_kwargs)
         log0(f"Patching missing resid_lambdas in model data to 1.0")
     # x0_lambdas defaults to 0.0 (disabled)
     if "x0_lambdas" not in model_data:
-        model_data["x0_lambdas"] = torch.zeros(n_layer)
+        model_data["x0_lambdas"] = torch.zeros(n_layer, **scalar_kwargs)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    if model_config.engram_lite:
+        if "bigram_lambdas" not in model_data:
+            model_data["bigram_lambdas"] = torch.zeros(n_layer, **scalar_kwargs)
+            log0(f"Patching missing bigram_lambdas in model data to 0.0")
+        if "bigram_embed.embed.weight" not in model_data:
+            bigram_shape = (model_config.vocab_size * model_config.engram_table_multiplier, model_config.n_embd)
+            model_data["bigram_embed.embed.weight"] = ref_tensor.new_zeros(bigram_shape)
+            log0(f"Patching missing bigram_embed.embed.weight in model data to zeros")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -93,7 +122,7 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
-    _patch_missing_config_keys(model_config_kwargs)
+    _patch_missing_config_keys(model_config_kwargs, model_data)
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)

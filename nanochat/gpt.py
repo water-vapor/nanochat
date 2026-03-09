@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    engram_lite: bool = False
+    engram_table_multiplier: int = 5
 
 
 def norm(x):
@@ -48,6 +50,25 @@ class Linear(nn.Linear):
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
+
+
+class BigramEmbed(nn.Module):
+    """Simple engram-lite module: hash bigrams into a static embedding table."""
+    def __init__(self, vocab_size: int, embed_dim: int, table_multiplier: int = 5):
+        super().__init__()
+        assert table_multiplier > 0, "engram_table_multiplier must be positive"
+        self.bigram_vocab_size = vocab_size * table_multiplier
+        self.embed = nn.Embedding(self.bigram_vocab_size, embed_dim)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        rand_int_1 = 36313
+        rand_int_2 = 27191
+        mod = self.bigram_vocab_size - 1
+
+        h = torch.empty_like(idx, dtype=torch.long)
+        h[:, 0] = mod  # reserved index for position 0 (no valid bigram yet)
+        h[:, 1:] = ((rand_int_1 * idx[:, 1:]) ^ (rand_int_2 * idx[:, :-1])) % mod
+        return self.embed(h)
 
 
 def has_ve(layer_idx, n_layer):
@@ -174,9 +195,12 @@ class GPT(nn.Module):
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
         # x0_lambdas: blends initial embedding back in at each layer (init 0.0 = disabled)
+        # bigram_lambdas: blends engram-lite bigram embeddings in at each layer
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
+        self.bigram_lambdas = nn.Parameter(torch.zeros(config.n_layer)) if config.engram_lite else None
+        self.bigram_embed = BigramEmbed(config.vocab_size, config.n_embd, config.engram_table_multiplier) if config.engram_lite else None
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -225,6 +249,9 @@ class GPT(nn.Module):
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
         self.x0_lambdas.fill_(0.1)      # 0.1 => small initial weight for skip connection to input embedding
+        if self.bigram_lambdas is not None:
+            self.bigram_lambdas.fill_(0.1)  # 0.1 => small initial weight for engram-lite residual
+            nn.init.zeros_(self.bigram_embed.embed.weight)  # start as exact no-op
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
@@ -247,6 +274,8 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+            if self.bigram_embed is not None:
+                self.bigram_embed.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -312,8 +341,12 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        bigram_embed_numel = self.bigram_embed.embed.weight.numel() if self.bigram_embed is not None else 0
+        scalar_numel = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        if self.bigram_lambdas is not None:
+            scalar_numel += self.bigram_lambdas.numel()
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          bigram_embed_numel + scalar_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -338,14 +371,18 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
+        bigram_embed = sum(p.numel() for p in self.bigram_embed.parameters()) if self.bigram_embed is not None else 0
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        if self.bigram_lambdas is not None:
+            scalars += self.bigram_lambdas.numel()
+        total = wte + bigram_embed + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
+            'bigram_embed': bigram_embed,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
@@ -364,7 +401,9 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        bigram_embed_params = list(self.bigram_embed.parameters()) if self.bigram_embed is not None else []
+        bigram_lambda_params = [self.bigram_lambdas] if self.bigram_lambdas is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(bigram_embed_params) + len(bigram_lambda_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -379,6 +418,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        if bigram_embed_params:
+            param_groups.append(dict(kind='adamw', params=bigram_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+        if bigram_lambda_params:
+            param_groups.append(dict(kind='adamw', params=bigram_lambda_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -407,10 +450,15 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+        x0_bigram = None
+        if self.bigram_embed is not None:
+            x0_bigram = self.bigram_embed(idx).to(x.dtype)
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            if x0_bigram is not None:
+                x = x + self.bigram_lambdas[i] * x0_bigram
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
